@@ -132,13 +132,17 @@ class Rules
     end
 
     def match?(entry, context)
-      @pattern.match?(entry["desc"]) &&
+      match_description?(entry) &&
         (@type ? entry_type(entry) == @type : true) &&
         (@account ? entry["account"] == (context.accounts.by_name(@account) or raise "Missing account #{@account}")["id"] : true) &&
         match_amount?(entry)
     end
 
   private
+
+    def match_description?(entry)
+      @pattern.match?(entry["desc"].gsub(/[\r\n]+/, " "))
+    end
 
     def match_amount?(entry)
       case [@amount_matcher, @amount]
