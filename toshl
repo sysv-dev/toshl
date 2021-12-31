@@ -1,0 +1,375 @@
+#!/usr/bin/env ruby
+require "optparse"
+require "optparse/date"
+require "date"
+require "json"
+require "yaml"
+require "faraday"
+require "digest"
+
+API_KEY = ENV.fetch("API_KEY")
+
+options = {
+  start_date: Date.new(1970, 1, 1),
+  end_date: Date.today,
+  config: "rules.yaml",
+  dry_run: false
+}
+
+OptionParser.new do |opts|
+  opts.banner = "Usage: toshl [options]"
+
+  opts.on("-s", "--state PATH", "Path to state file") do |value|
+    options[:state] = value
+  end
+
+  opts.on("-c", "--config PATH", "Path to config file") do |value|
+    options[:config] = value
+  end
+
+  opts.on("-d", "--dry-run", "Dry run") do |value|
+    options[:dry_run] = value
+  end
+
+  opts.on("--from DATE", Date, "Start date") do |value|
+    options[:start_date] = value
+  end
+
+  opts.on("--to DATE", Date, "End date") do |value|
+    options[:end_date] = value
+  end
+end.parse!
+
+class Api
+  def initialize(api_key)
+    @conn = Faraday.new(url: "https://api.toshl.com") do |f|
+      f.request :basic_auth, api_key, nil
+    end
+  end
+
+  def get(resource, params = {})
+    response = @conn.get(resource, params, "Accept" => "application/json")
+    raise "Failed to GET #{resource}, status: #{response.status}, body: #{response.body}" unless response.status.between?(200, 299)
+    {data: JSON.parse(response.body), headers: response.headers}
+  end
+
+  def get_all(resource, params = {})
+    results = []
+    loop do
+      response = get(resource, params)
+      results.concat(response[:data])
+
+      links = parse_links(response)
+      return {data: results, headers: response[:headers]} if links["next"].nil?
+
+      resource = links["next"]
+      params = {}
+    end
+  end
+
+  def put(resource, json)
+    response = @conn.put(resource, JSON.dump(json), "Content-Type" => "application/json")
+    raise "Failed to PUT #{resource}, status: #{response.status}, body: #{response.body}" unless response.status.between?(200, 299)
+    {data: JSON.parse(response.body), headers: response.headers}
+  end
+
+  private
+
+  def parse_links(response)
+    parts = response[:headers]["link"].split(',')
+    parts.map do |part, _|
+      section = part.split(';')
+      name = section[1][/rel="(.*)"/, 1]
+      url = section[0][/<(.*)>/, 1]
+      [name, url]
+    end.to_h
+  end
+end
+
+class State
+  attr_accessor :since, :hash
+
+  def initialize(path)
+    @path = path
+    @since = nil
+    @hash = nil
+  end
+
+  def load
+    state = JSON.parse(File.read(@path))
+    self.since = state["since"]
+    self.hash = state["hash"]
+    self
+  rescue Errno::ENOENT
+    self
+  end
+
+  def save
+    File.write(@path, JSON.dump("since" => since, "hash" => hash))
+    self
+  end
+end
+
+class Rules
+  include Enumerable
+
+  class Matcher
+    def initialize(value)
+      case value
+      when String
+        @pattern = Regexp.new(value, Regexp::IGNORECASE | Regexp::MULTILINE)
+      when Hash
+        @pattern = Regexp.new(value[:pattern], Regexp::IGNORECASE | Regexp::MULTILINE)
+        @type = value[:type] || "expense"
+        @account = value[:account]
+        @amount_matcher, amount = value[:amount]&.split(" ")
+        @amount = amount&.to_f
+        raise "Invalid type #{@type}" unless ["expense", "income", nil].include?(@type)
+        raise "Matcher amount also requires type of entry" if @amount && !@type
+      else
+        raise "Invalid pattern: #{value}"
+      end
+    end
+
+    def match?(entry, context)
+      @pattern.match?(entry["desc"]) &&
+        (@type ? entry_type(entry) == @type : true) &&
+        (@account ? entry["account"] == (context.accounts.by_name(@account) or raise "Missing account #{@account}")["id"] : true) &&
+        match_amount?(entry)
+    end
+
+  private
+
+    def match_amount?(entry)
+      case [@amount_matcher, @amount]
+      in [_, nil]
+        true
+      in ["=", amount]
+        entry["amount"].abs == amount
+      in [">", amount]
+        entry["amount"].abs > amount
+      in [">=", amount]
+        entry["amount"].abs >= amount
+      in ["<", amount]
+        entry["amount"].abs < amount
+      in ["<=", amount]
+        entry["amount"].abs <= amount
+      in [matcher, amount]
+        raise "Invalid amount matcher #{matcher} #{amount}"
+      end
+    end
+
+    def entry_type(entry) = if entry["amount"] < 0 then "expense" else "income" end
+  end
+
+  module Rule
+    def match?(entry, context) = matcher.match?(entry, context)
+
+    def diff_description(entry, context)
+      return {} unless description
+      return {} if entry["desc"] == description
+      {description: {
+        old: {value: entry["desc"].gsub("\n", " ")},
+        new: {value: description}
+      }}
+    end
+
+    def entry_type(entry) = if entry["amount"] < 0 then "expense" else "income" end
+  end
+
+  class Transfer < Struct.new(:matcher, :description, :account)
+    include Rule
+
+    def diff(entry, context) 
+      diff_description(entry, context)
+        .merge(diff_account(entry, context))
+    end
+
+    def diff_account(entry, context)
+      return {} unless account
+      new_account = context.accounts.by_name(account) or raise "Account #{account} missing"
+      old_account = context.accounts.by_id(entry.dig("transaction", "account")) || {}
+      return {} if old_account["id"] == new_account["id"]
+      return {} if entry["account"] == new_account["id"]
+      {account: {
+        old: {id: old_account["id"], value: old_account["name"]},
+        new: {id: new_account["id"], value: new_account["name"]}
+      }}
+    end
+  end
+
+  class Entry < Struct.new(:matcher, :description, :category, :tags)
+    include Rule
+
+    def diff(entry, context)
+      diff_description(entry, context)
+        .merge(diff_category(entry, context))
+        .merge(diff_tags(entry, context))
+    end
+
+    def diff_category(entry, context)
+      return {} unless category
+      type = entry_type(entry)
+      new_category = context.categories.by_name(category, type) or raise "Category #{category} (#{type}) missing"
+      old_category = context.categories.by_id(entry["category"]) || {}
+      return {} if old_category["id"] == new_category["id"]
+      {category: {
+        old: {id: old_category["id"], value: old_category["name"]},
+        new: {id: new_category["id"], value: new_category["name"]}
+      }}
+    end
+
+    def diff_tags(entry, context)
+      return {} unless tags
+      type = entry_type(entry)
+      new_tag_ids = tags.map { |tag| context.tags.by_name(tag, type) or raise "Tag #{tag} (#{type}) missing" }.map { |tag| tag["id"] }
+      new_tag_names = tags
+      old_tag_ids = entry["tags"] || []
+      old_tag_names = old_tag_ids.map { |id| context.tags.by_id(id)&.then { |tag| tag["name"] } }
+      return {} if old_tag_ids.sort == new_tag_ids.sort
+      {tags: {
+        old: {ids: old_tag_ids, value: old_tag_names},
+        new: {ids: new_tag_ids, value: new_tag_names}
+      }}
+    end
+  end
+
+  def initialize(path)
+    data = YAML.safe_load_file(path, symbolize_names: true)
+    @rules = YAML.safe_load_file(path, symbolize_names: true).map { |value| parse_rule(value) }
+    @hash = Digest::SHA256.hexdigest(JSON.dump(data))
+  end
+
+  def hash = @hash
+  def each(&block) = @rules.each(&block)
+  def to_s = "Rules<#{@rules.to_s}>"
+
+  private
+
+  def parse_rule(value)
+    case value
+    in match:, transfer:
+      Transfer.new(Matcher.new(match), value[:description], transfer)
+    in match:
+      Entry.new(Matcher.new(match), value[:description], value[:category], value[:tags])
+    end
+  end
+end
+
+class Accounts
+  def initialize(accounts)
+    @accounts_by_id = accounts.to_h { |account| [account["id"], account] }
+    @accounts_by_name = accounts.to_h { |account| [account["name"], account] }
+  end
+
+  def by_id(id) = @accounts_by_id[id]
+  def by_name(name) = @accounts_by_name[name]
+  def to_s = "Accounts<#{@accounts_by_id.values.to_s}>"
+end
+
+class Categories  
+  def initialize(categories)
+    @categories_by_id = categories.to_h { |category| [category["id"], category] }
+    @categories_by_name = categories.to_h { |category| [[category["name"], category["type"]], category] }
+  end
+
+  def by_id(id) = @categories_by_id[id]
+  def by_name(name, type) = @categories_by_name[[name, type]]
+  def to_s = "categories<#{@Categories_by_id.values.to_s}>"
+end
+
+class Tags
+  def initialize(tags)
+    @tags_by_id = tags.to_h { |tag| [tag["id"], tag] }
+    @tags_by_name = tags.to_h { |tag| [[tag["name"], tag["type"]], tag] }
+  end
+
+  def by_id(id) = @tags_by_id[id]
+  def by_name(name, type) = @tags_by_name[[name, type]]
+  def to_s = "Tags<#{@tags_by_id.values.to_s}>"
+end
+
+class Context < Struct.new(:accounts, :categories, :tags)
+end
+
+def print_entry_diff(entry, diff, context)
+  puts "#{entry["desc"].gsub("\n", " ")} (#{entry["id"]}) [#{entry["date"]}] [#{context.accounts.by_id(entry["account"])["name"]}] (#{entry["amount"]} #{entry["currency"]["code"]})"
+  puts "  account: #{diff[:account][:new][:value]} (#{diff[:account][:new][:id]})" if diff[:account]
+  puts "  category: #{diff[:category][:old][:value]} (#{diff[:category][:old][:id]}) -> #{diff[:category][:new][:value]} (#{diff[:category][:new][:id]})" if diff[:category]
+  puts "  tags: #{diff[:tags][:old][:value].join(", ")} (#{diff[:tags][:old][:ids].join(", ")}) -> #{diff[:tags][:new][:value].join(", ")} (#{diff[:tags][:new][:ids].join(", ")})" if diff[:tags]
+  puts "  description: #{diff[:description][:old][:value]} -> #{diff[:description][:new][:value]}" if diff[:description]
+end
+
+api = Api.new(API_KEY)
+state = State.new(options[:state]).load if options[:state]
+rules = Rules.new(options[:config])
+
+if state && state.hash != rules.hash
+  puts "The configuration file has changed. Clearning state."
+  state.since = nil
+  state.hash = rules.hash
+end
+
+puts "Fetching entries (range: #{options[:start_date]} - #{options[:end_date]}, cache: #{state&.since || "null"})..."
+params = state&.since ? {since: state.since} : {}
+response = api.get_all("entries", params.merge(per_page: 500, from: options[:start_date], to: options[:end_date]))
+
+if response[:data].empty?
+  puts "No new entries."
+  exit 0
+end
+
+puts "Fetching accounts..."
+accounts = Accounts.new(api.get_all("accounts", per_page: 500)[:data])
+puts "Fetching categories..."
+categories = Categories.new(api.get_all("categories", per_page: 500)[:data])
+puts "Fetching tags..."
+tags = Tags.new(api.get_all("tags", per_page: 500)[:data])
+context = Context.new(accounts, categories, tags)
+
+puts "Performing diff..."
+state&.since = response[:headers]["Toshl-Modified"]
+entries = response[:data]
+changes = entries.filter_map do |entry|
+  diff = rules
+    .find { |rule| rule.match?(entry, context) }
+    &.then { |rule| rule.diff(entry, context) }
+    &.then { |diff| [entry, diff] unless diff.empty? }
+end
+
+if changes.empty?
+  puts "No changes necessary."
+elsif options[:dry_run]
+  changes.each do |entry, diff|
+    print_entry_diff(entry, diff, context)
+  end
+else
+  puts "Applying changes..."
+  changes.each do |entry, diff|
+    print_entry_diff(entry, diff, context)
+  
+    if diff[:account]
+      entry["transaction"] ||= {}
+      entry["transaction"]["account"] = diff[:account][:new][:id]
+      entry["transaction"]["currency"] ||= { "code" => "EUR" }
+      entry.delete("category")
+      entry.delete("tags")
+    end
+  
+    if diff[:category]
+      entry["category"] = diff[:category][:new][:id]
+    end
+  
+    if diff[:tags]
+      entry["tags"] = diff[:tags][:new][:ids]
+    end
+  
+    if diff[:description]
+      entry["desc"] = diff[:description][:new][:value]
+    end
+
+    api.put("entries/#{entry["id"]}", entry)
+  end
+end
+
+state&.save unless options[:dry_run]
