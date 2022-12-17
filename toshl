@@ -304,6 +304,8 @@ def print_entry_diff(entry, diff, context)
   puts "  description: #{diff[:description][:old][:value]} -> #{diff[:description][:new][:value]}" if diff[:description]
 end
 
+Faraday::Utils.default_space_encoding = '%20'
+
 api = Api.new(API_KEY)
 state = State.new(options[:state]).load if options[:state]
 rules = Rules.new(options[:config])
